@@ -1,33 +1,36 @@
+# simple_multi_cipher_tool.py
 import os
 import base64
 import hashlib
+import secrets
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 import pyperclip
 
-# ============================
-# Config / Constants
-# ============================
-APP_TITLE = "🔐 Multi-Cipher Encryption Tool"
+# -----------------------
+# Config
+# -----------------------
 FIXED_SALT = "ProfessionalEncryptionTool_v1.0"
 
-# ============================
-# Key derivation from Gate (for Fernet)
-# ============================
+# -----------------------
+# Helper: Gate -> Fernet Key
+# -----------------------
 def generate_key_from_gate(gate_name: str) -> bytes:
-    """Derive a 32-byte value from (gate_name + FIXED_SALT) via SHA-256,
-    then return it base64-urlsafe-encoded for Fernet.
-    """
     if not gate_name or gate_name == "Select Gate":
         raise ValueError("Gate name required")
     combined = (gate_name + "|" + FIXED_SALT).encode()
-    digest = hashlib.sha256(combined).digest()  # 32 bytes
-    return base64.urlsafe_b64encode(digest)     # valid Fernet key
+    digest = hashlib.sha256(combined).digest()
+    return base64.urlsafe_b64encode(digest)  # valid Fernet key (32 bytes -> base64)
 
-# ============================
+# -----------------------
 # Caesar Cipher
-# ============================
+# -----------------------
 def caesar_shift_char(ch: str, shift: int) -> str:
     if ch.isalpha():
         base = ord('A') if ch.isupper() else ord('a')
@@ -40,381 +43,472 @@ def caesar_encrypt(text: str, shift: int = 3) -> str:
 def caesar_decrypt(text: str, shift: int = 3) -> str:
     return caesar_encrypt(text, -shift)
 
-# ============================
+# -----------------------
 # Substitution Cipher (fixed mapping)
-# Mapping chosen for demo; you can customize.
-# ============================
-SUB_MAP_UPPER = {
+# -----------------------
+SUB_MAP = {
     "A":"Q","B":"W","C":"E","D":"R","E":"T","F":"Y","G":"U","H":"I","I":"O","J":"P",
     "K":"A","L":"S","M":"D","N":"F","O":"G","P":"H","Q":"J","R":"K","S":"L","T":"Z",
     "U":"X","V":"C","W":"V","X":"B","Y":"N","Z":"M"
 }
-REV_SUB_MAP_UPPER = {v: k for k, v in SUB_MAP_UPPER.items()}
+REV_SUB_MAP = {v: k for k, v in SUB_MAP.items()}
 
-def _subst_map_char(ch: str, mapping: dict) -> str:
-    if ch.isalpha():
-        is_upper = ch.isupper()
-        up = ch.upper()
-        mapped = mapping.get(up, up)
-        return mapped if is_upper else mapped.lower()
-    return ch
+def substitute_char(ch: str, mapping: dict) -> str:
+    if not ch.isalpha():
+        return ch
+    is_upper = ch.isupper()
+    mapped = mapping.get(ch.upper(), ch.upper())
+    return mapped if is_upper else mapped.lower()
 
 def substitution_encrypt(text: str) -> str:
-    return ''.join(_subst_map_char(c, SUB_MAP_UPPER) for c in text)
+    return ''.join(substitute_char(c, SUB_MAP) for c in text)
 
 def substitution_decrypt(text: str) -> str:
-    return ''.join(_subst_map_char(c, REV_SUB_MAP_UPPER) for c in text)
+    return ''.join(substitute_char(c, REV_SUB_MAP) for c in text)
 
-# ============================
-# GUI Callbacks: Text Encryption / Decryption
-# ============================
-def get_caesar_shift_value() -> int:
-    """Read shift from entry; default to 3 on invalid input."""
-    raw = shift_entry.get().strip()
-    if raw == "":
-        return 3
+# -----------------------
+# Hill Cipher (2x2) - simple educational implementation
+# key format: "a,b,c,d" (row-major)
+# -----------------------
+def egcd(a, b):
+    if a == 0:
+        return (b, 0, 1)
+    g, y, x = egcd(b % a, a)
+    return (g, x - (b // a) * y, y)
+
+def modinv(a, m):
+    g, x, _ = egcd(a % m, m)
+    if g != 1:
+        return None
+    return x % m
+
+def parse_hill_key(raw: str):
+    parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
+    if len(parts) != 4:
+        raise ValueError("Hill key must be 4 integers separated by commas (a,b,c,d).")
+    mat = [int(x) % 26 for x in parts]
+    return [[mat[0], mat[1]], [mat[2], mat[3]]]
+
+def hill_encrypt(plain: str, key_matrix):
+    p = ''.join([c.upper() for c in plain if c.isalpha()])
+    if len(p) % 2 == 1:
+        p += 'X'
+    out = []
+    for i in range(0, len(p), 2):
+        v1 = ord(p[i]) - 65
+        v2 = ord(p[i+1]) - 65
+        c1 = (key_matrix[0][0]*v1 + key_matrix[0][1]*v2) % 26
+        c2 = (key_matrix[1][0]*v1 + key_matrix[1][1]*v2) % 26
+        out.append(chr(c1 + 65))
+        out.append(chr(c2 + 65))
+    return ''.join(out)
+
+def hill_decrypt(cipher: str, key_matrix):
+    c = ''.join([ch.upper() for ch in cipher if ch.isalpha()])
+    a, b = key_matrix[0]
+    c2, d = key_matrix[1]
+    det = (a*d - b*c2) % 26
+    inv_det = modinv(det, 26)
+    if inv_det is None:
+        raise ValueError("Hill key matrix not invertible modulo 26.")
+    inv = [
+        [(d * inv_det) % 26, ((-b) * inv_det) % 26],
+        (((-c2) * inv_det) % 26, (a * inv_det) % 26)
+    ]
+    out = []
+    for i in range(0, len(c), 2):
+        v1 = ord(c[i]) - 65
+        v2 = ord(c[i+1]) - 65
+        p1 = (inv[0][0]*v1 + inv[0][1]*v2) % 26
+        p2 = (inv[1][0]*v1 + inv[1][1]*v2) % 26
+        out.append(chr(p1 + 65))
+        out.append(chr(p2 + 65))
+    return ''.join(out)
+
+# -----------------------
+# Playfair Cipher (I/J merged)
+# -----------------------
+def build_playfair_square(key_phrase: str):
+    key_phrase = key_phrase.upper().replace("J", "I")
+    seen = []
+    for ch in key_phrase:
+        if ch.isalpha() and ch not in seen:
+            seen.append(ch)
+    for ch in "ABCDEFGHIKLMNOPQRSTUVWXYZ":
+        if ch not in seen:
+            seen.append(ch)
+    grid = [seen[i*5:(i+1)*5] for i in range(5)]
+    pos = {grid[r][c]: (r, c) for r in range(5) for c in range(5)}
+    return grid, pos
+
+def playfair_prepare(text: str):
+    txt = ''.join([c.upper().replace("J","I") for c in text if c.isalpha()])
+    pairs = []
+    i = 0
+    while i < len(txt):
+        a = txt[i]
+        b = txt[i+1] if i+1 < len(txt) else 'X'
+        if a == b:
+            pairs.append(a + 'X')
+            i += 1
+        else:
+            pairs.append(a + b)
+            i += 2
+    if len(pairs[-1]) == 1:
+        pairs[-1] += 'X'
+    return pairs
+
+def playfair_encrypt(plain: str, key_phrase: str):
+    grid, pos = build_playfair_square(key_phrase)
+    pairs = playfair_prepare(plain)
+    out = []
+    for pair in pairs:
+        r1, c1 = pos[pair[0]]
+        r2, c2 = pos[pair[1]]
+        if r1 == r2:
+            out.append(grid[r1][(c1+1)%5])
+            out.append(grid[r2][(c2+1)%5])
+        elif c1 == c2:
+            out.append(grid[(r1+1)%5][c1])
+            out.append(grid[(r2+1)%5][c2])
+        else:
+            out.append(grid[r1][c2])
+            out.append(grid[r2][c1])
+    return ''.join(out)
+
+def playfair_decrypt(cipher: str, key_phrase: str):
+    grid, pos = build_playfair_square(key_phrase)
+    txt = ''.join([c.upper() for c in cipher if c.isalpha()])
+    pairs = [txt[i:i+2] for i in range(0, len(txt), 2)]
+    out = []
+    for pair in pairs:
+        r1, c1 = pos[pair[0]]
+        r2, c2 = pos[pair[1]]
+        if r1 == r2:
+            out.append(grid[r1][(c1-1)%5])
+            out.append(grid[r2][(c2-1)%5])
+        elif c1 == c2:
+            out.append(grid[(r1-1)%5][c1])
+            out.append(grid[(r2-1)%5][c2])
+        else:
+            out.append(grid[r1][c2])
+            out.append(grid[r2][c1])
+    return ''.join(out)
+
+# -----------------------
+# PGP-like RSA-4096 Hybrid (AES-GCM + RSA-OAEP)
+# -----------------------
+def generate_rsa_4096_keypair(priv_path: str, pub_path: str):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    priv_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pub_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    with open(priv_path, 'wb') as f:
+        f.write(priv_pem)
+    with open(pub_path, 'wb') as f:
+        f.write(pub_pem)
+    return priv_path, pub_path
+
+def load_public_key(path: str):
+    with open(path, 'rb') as f:
+        data = f.read()
+    return serialization.load_pem_public_key(data)
+
+def load_private_key(path: str):
+    with open(path, 'rb') as f:
+        data = f.read()
+    return serialization.load_pem_private_key(data, password=None)
+
+def pgp_encrypt_bytes(public_key, data: bytes) -> bytes:
+    aes_key = AESGCM.generate_key(bit_length=256)
+    aesgcm = AESGCM(aes_key)
+    nonce = secrets.token_bytes(12)
+    ct = aesgcm.encrypt(nonce, data, None)
+    enc_key = public_key.encrypt(
+        aes_key,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    )
+    # Package as base64 parts joined by :: (safe for text)
+    payload = base64.b64encode(enc_key) + b"::" + base64.b64encode(nonce) + b"::" + base64.b64encode(ct)
+    return payload
+
+def pgp_decrypt_bytes(private_key, payload: bytes) -> bytes:
+    parts = payload.split(b"::")
+    if len(parts) != 3:
+        raise ValueError("Invalid PGP payload format.")
+    enc_key = base64.b64decode(parts[0])
+    nonce = base64.b64decode(parts[1])
+    ct = base64.b64decode(parts[2])
+    aes_key = private_key.decrypt(
+        enc_key,
+        padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    )
+    aesgcm = AESGCM(aes_key)
+    data = aesgcm.decrypt(nonce, ct, None)
+    return data
+
+# -----------------------
+# GUI and callbacks
+# -----------------------
+current_public_key = None
+current_private_key = None
+
+root = tk.Tk()
+root.title("Simple Multi-Cipher Tool")
+root.geometry("900x680")
+root.configure(bg="#121212")
+root.resizable(False, False)
+
+# Top controls
+top = tk.Frame(root, bg="#121212")
+top.pack(fill=tk.X, padx=12, pady=8)
+
+cipher_var = tk.StringVar(value="Fernet (Gate Key)")
+cipher_choices = [
+    "Fernet (Gate Key)",
+    "Caesar Cipher",
+    "Substitution Cipher",
+    "Hill Cipher (2x2)",
+    "Playfair Cipher",
+    "PGP (RSA-4096)"
+]
+
+tk.Label(top, text="Cipher:", fg="#DDDDDD", bg="#121212").pack(side=tk.LEFT, padx=(6,2))
+cipher_cb = ttk.Combobox(top, values=cipher_choices, textvariable=cipher_var, state="readonly", width=24)
+cipher_cb.pack(side=tk.LEFT, padx=(0,8))
+
+# Gate
+tk.Label(top, text="Gate:", fg="#DDDDDD", bg="#121212").pack(side=tk.LEFT, padx=(6,2))
+gate_var = tk.StringVar(value="AND")
+gate_cb = ttk.Combobox(top, values=["AND","OR","XOR","NAND","NOR"], textvariable=gate_var, state="readonly", width=10)
+gate_cb.pack(side=tk.LEFT, padx=(0,8))
+
+# Caesar shift
+tk.Label(top, text="Shift:", fg="#DDDDDD", bg="#121212").pack(side=tk.LEFT, padx=(6,2))
+shift_entry = tk.Entry(top, width=6)
+shift_entry.insert(0, "3")
+shift_entry.pack(side=tk.LEFT, padx=(0,8))
+
+# Hill key
+tk.Label(top, text="Hill key a,b,c,d:", fg="#DDDDDD", bg="#121212").pack(side=tk.LEFT, padx=(6,2))
+hill_key_entry = tk.Entry(top, width=12)
+hill_key_entry.insert(0, "3,3,2,5")
+hill_key_entry.pack(side=tk.LEFT, padx=(0,8))
+
+# Playfair key
+tk.Label(top, text="Playfair key:", fg="#DDDDDD", bg="#121212").pack(side=tk.LEFT, padx=(6,2))
+playfair_key_entry = tk.Entry(top, width=12)
+playfair_key_entry.insert(0, "MONARCHY")
+playfair_key_entry.pack(side=tk.LEFT, padx=(0,8))
+
+# PGP buttons
+pgp_frame = tk.Frame(root, bg="#121212")
+pgp_frame.pack(fill=tk.X, padx=12, pady=(0,6))
+tk.Button(pgp_frame, text="Generate RSA-4096", command=lambda: generate_keys(), bg="#333", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(pgp_frame, text="Load Public Key", command=lambda: load_pub(), bg="#333", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(pgp_frame, text="Load Private Key", command=lambda: load_priv(), bg="#333", fg="white").pack(side=tk.LEFT, padx=6)
+
+# Text area
+text_area = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=110, height=28, bg="#1E1E1E", fg="#EDEDED", insertbackground="white", font=("Consolas", 11))
+text_area.pack(padx=12, pady=(4,8), fill=tk.BOTH, expand=True)
+
+# Buttons
+btn_frame = tk.Frame(root, bg="#121212")
+btn_frame.pack(fill=tk.X, padx=12, pady=(0,10))
+
+def get_shift():
     try:
-        val = int(raw)
-        # Normalize overly large values
-        if val > 10_000 or val < -10_000:
-            val = val % 26
-        return val
-    except ValueError:
-        messagebox.showwarning("Shift value", "Invalid shift. Using default shift = 3.")
+        s = int(shift_entry.get().strip())
+        return s % 26
+    except Exception:
         return 3
+
+def generate_keys():
+    priv_path = filedialog.asksaveasfilename(title="Save private key as", defaultextension=".pem", filetypes=[("PEM","*.pem")])
+    if not priv_path:
+        return
+    pub_path = filedialog.asksaveasfilename(title="Save public key as", defaultextension=".pem", filetypes=[("PEM","*.pem")])
+    if not pub_path:
+        return
+    try:
+        generate_rsa_4096_keypair(priv_path, pub_path)
+        messagebox.showinfo("Keys", "RSA-4096 keypair generated and saved.")
+    except Exception as e:
+        messagebox.showerror("Keygen error", str(e))
+
+def load_pub():
+    global current_public_key
+    path = filedialog.askopenfilename(title="Select public key (PEM)", filetypes=[("PEM","*.pem"), ("All","*.*")])
+    if not path:
+        return
+    try:
+        current_public_key = load_public_key(path)
+        messagebox.showinfo("Public Key", "Public key loaded.")
+    except Exception as e:
+        messagebox.showerror("Load public key", str(e))
+
+def load_priv():
+    global current_private_key
+    path = filedialog.askopenfilename(title="Select private key (PEM)", filetypes=[("PEM","*.pem"), ("All","*.*")])
+    if not path:
+        return
+    try:
+        current_private_key = load_private_key(path)
+        messagebox.showinfo("Private Key", "Private key loaded.")
+    except Exception as e:
+        messagebox.showerror("Load private key", str(e))
 
 def encrypt_text():
-    cipher = cipher_var.get()
-    plain = text_area.get("1.0", tk.END).rstrip("\n")
+    mode = cipher_var.get()
+    plain = text_area.get("1.0", tk.END).strip()
     if not plain:
-        messagebox.showwarning("Input empty", "Please enter text to encrypt.")
+        messagebox.showwarning("Empty", "Please enter text to encrypt.")
         return
-
     try:
-        if cipher == "Fernet (Gate Key)":
-            gate = gate_var.get()
-            if gate == "Select Gate":
-                messagebox.showwarning("Select Gate", "Please choose a gate from the dropdown.")
-                return
-            key = generate_key_from_gate(gate)
+        if mode == "Fernet (Gate Key)":
+            key = generate_key_from_gate(gate_var.get())
             f = Fernet(key)
-            encrypted = f.encrypt(plain.encode()).decode()
-        elif cipher == "Caesar Cipher":
-            shift = get_caesar_shift_value()
-            encrypted = caesar_encrypt(plain, shift)
-        elif cipher == "Substitution Cipher":
-            encrypted = substitution_encrypt(plain)
+            out = f.encrypt(plain.encode()).decode()
+        elif mode == "Caesar Cipher":
+            out = caesar_encrypt(plain, get_shift())
+        elif mode == "Substitution Cipher":
+            out = substitution_encrypt(plain)
+        elif mode == "Hill Cipher (2x2)":
+            km = parse_hill_key(hill_key_entry.get().strip())
+            out = hill_encrypt(plain, km)
+        elif mode == "Playfair Cipher":
+            out = playfair_encrypt(plain, playfair_key_entry.get().strip() or "KEY")
+        elif mode == "PGP (RSA-4096)":
+            if current_public_key is None:
+                messagebox.showwarning("PGP", "Load a public key first.")
+                return
+            payload = pgp_encrypt_bytes(current_public_key, plain.encode())
+            out = payload.decode()
         else:
-            encrypted = plain
-
+            out = plain
         text_area.delete("1.0", tk.END)
-        text_area.insert(tk.END, encrypted)
+        text_area.insert(tk.END, out)
     except Exception as e:
-        messagebox.showerror("Encryption Error", str(e))
-
+        messagebox.showerror("Encryption error", str(e))
 
 def decrypt_text():
-    cipher = cipher_var.get()
+    mode = cipher_var.get()
     blob = text_area.get("1.0", tk.END).strip()
     if not blob:
-        messagebox.showwarning("Input empty", "Please enter encrypted text to decrypt.")
+        messagebox.showwarning("Empty", "Please enter text to decrypt.")
         return
-
     try:
-        if cipher == "Fernet (Gate Key)":
-            gate = gate_var.get()
-            if gate == "Select Gate":
-                messagebox.showwarning("Select Gate", "Please choose a gate from the dropdown.")
-                return
-            key = generate_key_from_gate(gate)
+        if mode == "Fernet (Gate Key)":
+            key = generate_key_from_gate(gate_var.get())
             f = Fernet(key)
-            decrypted_bytes = f.decrypt(blob.encode())
-            try:
-                decrypted = decrypted_bytes.decode()
-            except UnicodeDecodeError:
-                # If it's binary data, show info and do not overwrite
-                messagebox.showinfo("Decrypted (binary)", "Decryption succeeded but result is binary data. Use 'Decrypt File' for files.")
+            dec_bytes = f.decrypt(blob.encode())
+            out = dec_bytes.decode()
+        elif mode == "Caesar Cipher":
+            out = caesar_decrypt(blob, get_shift())
+        elif mode == "Substitution Cipher":
+            out = substitution_decrypt(blob)
+        elif mode == "Hill Cipher (2x2)":
+            km = parse_hill_key(hill_key_entry.get().strip())
+            out = hill_decrypt(blob, km)
+        elif mode == "Playfair Cipher":
+            out = playfair_decrypt(blob, playfair_key_entry.get().strip() or "KEY")
+        elif mode == "PGP (RSA-4096)":
+            if current_private_key is None:
+                messagebox.showwarning("PGP", "Load a private key first.")
                 return
-        elif cipher == "Caesar Cipher":
-            shift = get_caesar_shift_value()
-            decrypted = caesar_decrypt(blob, shift)
-        elif cipher == "Substitution Cipher":
-            decrypted = substitution_decrypt(blob)
+            data = pgp_decrypt_bytes(current_private_key, blob.encode())
+            out = data.decode()
         else:
-            decrypted = blob
-
+            out = blob
         text_area.delete("1.0", tk.END)
-        text_area.insert(tk.END, decrypted)
-    except Exception:
-        messagebox.showerror("Decryption Error", "Failed to decrypt. Wrong key/shift or invalid data.")
+        text_area.insert(tk.END, out)
+    except Exception as e:
+        messagebox.showerror("Decryption error", str(e))
 
-# ============================
-# File Encryption / Decryption (Fernet only)
-# ============================
 def encrypt_file():
-    if cipher_var.get() != "Fernet (Gate Key)":
-        messagebox.showinfo("Files not supported", "File encryption is only available with Fernet.")
+    mode = cipher_var.get()
+    if mode not in ("Fernet (Gate Key)", "PGP (RSA-4096)"):
+        messagebox.showinfo("Files", "File encryption is only for Fernet and PGP modes.")
         return
-
-    gate = gate_var.get()
-    if gate == "Select Gate":
-        messagebox.showwarning("Select Gate", "Please choose a gate from the dropdown.")
-        return
-
     file_path = filedialog.askopenfilename(title="Select file to encrypt")
     if not file_path:
         return
     try:
-        key = generate_key_from_gate(gate)
-        f = Fernet(key)
         with open(file_path, "rb") as fr:
             data = fr.read()
-        encrypted = f.encrypt(data)
-        default_name = os.path.basename(file_path) + ".encrypted"
-        save_path = filedialog.asksaveasfilename(
-            title="Save encrypted file as",
-            initialfile=default_name,
-            defaultextension=".encrypted",
-            filetypes=[("Encrypted files", "*.encrypted"), ("All files", "*.*")]
-        )
+        if mode == "Fernet (Gate Key)":
+            key = generate_key_from_gate(gate_var.get())
+            f = Fernet(key)
+            enc = f.encrypt(data)
+        else:  # PGP
+            if current_public_key is None:
+                messagebox.showwarning("PGP", "Load a public key first.")
+                return
+            enc = pgp_encrypt_bytes(current_public_key, data)
+        save_path = filedialog.asksaveasfilename(title="Save encrypted file as", initialfile=os.path.basename(file_path) + ".encrypted")
         if save_path:
             with open(save_path, "wb") as fw:
-                fw.write(encrypted)
-            messagebox.showinfo("Success", f"Encrypted and saved to:\n{save_path}")
+                fw.write(enc)
+            messagebox.showinfo("Success", f"Encrypted and saved to: {save_path}")
     except Exception as e:
-        messagebox.showerror("Encryption Error", str(e))
-
+        messagebox.showerror("File encrypt error", str(e))
 
 def decrypt_file():
-    if cipher_var.get() != "Fernet (Gate Key)":
-        messagebox.showinfo("Files not supported", "File decryption is only available with Fernet.")
+    mode = cipher_var.get()
+    if mode not in ("Fernet (Gate Key)", "PGP (RSA-4096)"):
+        messagebox.showinfo("Files", "File decryption is only for Fernet and PGP modes.")
         return
-
-    gate = gate_var.get()
-    if gate == "Select Gate":
-        messagebox.showwarning("Select Gate", "Please choose a gate from the dropdown.")
-        return
-
-    file_path = filedialog.askopenfilename(
-        title="Select encrypted file",
-        filetypes=[("Encrypted files", "*.encrypted"), ("All files", "*.*")]
-    )
+    file_path = filedialog.askopenfilename(title="Select encrypted file", filetypes=[("Encrypted","*.encrypted"), ("All","*.*")])
     if not file_path:
         return
-
     try:
-        key = generate_key_from_gate(gate)
-        f = Fernet(key)
         with open(file_path, "rb") as fr:
-            encrypted_data = fr.read()
-        decrypted = f.decrypt(encrypted_data)
-        default_name = os.path.basename(file_path).replace(".encrypted", ".decrypted")
-        save_path = filedialog.asksaveasfilename(
-            title="Save decrypted file as",
-            initialfile=default_name
-        )
+            data = fr.read()
+        if mode == "Fernet (Gate Key)":
+            key = generate_key_from_gate(gate_var.get())
+            f = Fernet(key)
+            dec = f.decrypt(data)
+        else:
+            if current_private_key is None:
+                messagebox.showwarning("PGP", "Load a private key first.")
+                return
+            dec = pgp_decrypt_bytes(current_private_key, data)
+        save_path = filedialog.asksaveasfilename(title="Save decrypted file as", initialfile=os.path.basename(file_path).replace(".encrypted", ".decrypted"))
         if save_path:
             with open(save_path, "wb") as fw:
-                fw.write(decrypted)
-            messagebox.showinfo("Success", f"Decrypted and saved to:\n{save_path}")
-    except Exception:
-        messagebox.showerror("Decryption Error", "Failed to decrypt file. Wrong gate or corrupted file.")
+                fw.write(dec)
+            messagebox.showinfo("Success", f"Decrypted and saved to: {save_path}")
+    except Exception as e:
+        messagebox.showerror("File decrypt error", str(e))
 
-# ============================
-# Clipboard utilities
-# ============================
-def copy_to_clipboard():
-    content = text_area.get("1.0", tk.END).strip()
-    if not content:
+def copy_clip():
+    txt = text_area.get("1.0", tk.END).strip()
+    if not txt:
         messagebox.showwarning("Empty", "Nothing to copy.")
         return
-    pyperclip.copy(content)
+    pyperclip.copy(txt)
     messagebox.showinfo("Copied", "Text copied to clipboard.")
 
-
-def paste_from_clipboard():
+def paste_clip():
     try:
         txt = pyperclip.paste()
         text_area.delete("1.0", tk.END)
         text_area.insert(tk.END, txt)
     except Exception as e:
-        messagebox.showerror("Clipboard Error", str(e))
+        messagebox.showerror("Clipboard error", str(e))
 
-# ============================
-# UI - Professional Dark Theme
-# ============================
-root = tk.Tk()
-root.title(APP_TITLE)
-root.geometry("820x600")
-root.configure(bg="#121212")
-root.resizable(False, False)
-
-# ---- Top frame (title + selectors)
-top_frame = tk.Frame(root, bg="#121212")
-top_frame.pack(fill=tk.X, padx=16, pady=(12, 6))
-
-title_lbl = tk.Label(
-    top_frame,
-    text="Multi-Cipher Encryption (Fernet + Caesar + Substitution)",
-    fg="white",
-    bg="#121212",
-    font=("Segoe UI", 16, "bold")
-)
-title_lbl.pack(side=tk.LEFT)
-
-# Right controls container
-controls_frame = tk.Frame(top_frame, bg="#121212")
-controls_frame.pack(side=tk.RIGHT)
-
-# Cipher selection
-cipher_var = tk.StringVar(value="Fernet (Gate Key)")
-ciphers = ["Fernet (Gate Key)", "Caesar Cipher", "Substitution Cipher"]
-
-cipher_label = tk.Label(controls_frame, text="Cipher:", fg="#DDDDDD", bg="#121212", font=("Segoe UI", 10))
-cipher_label.grid(row=0, column=0, padx=(0, 6), pady=2, sticky="e")
-
-cipher_combo = ttk.Combobox(
-    controls_frame,
-    values=ciphers,
-    state="readonly",
-    textvariable=cipher_var,
-    width=22,
-    font=("Segoe UI", 10)
-)
-cipher_combo.grid(row=0, column=1, pady=2)
-
-# Gate selection (Fernet only)
-gate_var = tk.StringVar(value="AND")
-gates = ["AND", "OR", "XOR", "NAND", "NOR"]
-
-gate_label = tk.Label(controls_frame, text="Gate:", fg="#DDDDDD", bg="#121212", font=("Segoe UI", 10))
-gate_label.grid(row=1, column=0, padx=(0, 6), pady=2, sticky="e")
-
-gate_combo = ttk.Combobox(
-    controls_frame,
-    values=gates,
-    state="readonly",
-    textvariable=gate_var,
-    width=22,
-    font=("Segoe UI", 10)
-)
-gate_combo.grid(row=1, column=1, pady=2)
-
-# Caesar shift (Caesar only)
-shift_label = tk.Label(controls_frame, text="Shift:", fg="#DDDDDD", bg="#121212", font=("Segoe UI", 10))
-shift_label.grid(row=2, column=0, padx=(0, 6), pady=2, sticky="e")
-
-shift_entry = tk.Entry(controls_frame, width=24, font=("Segoe UI", 10))
-shift_entry.insert(0, "3")
-shift_entry.grid(row=2, column=1, pady=2)
-
-# Helper: enable/disable controls based on selected cipher
-def update_controls(*_):
-    c = cipher_var.get()
-    is_fernet = (c == "Fernet (Gate Key)")
-    is_caesar = (c == "Caesar Cipher")
-
-    # Gate controls
-    state_gate = "normal" if is_fernet else "disabled"
-    gate_combo.configure(state="readonly" if is_fernet else "disabled")
-    gate_label.configure(fg="#DDDDDD" if is_fernet else "#6A6A6A")
-
-    # Shift controls
-    state_shift = "normal" if is_caesar else "disabled"
-    shift_entry.configure(state=state_shift)
-    shift_label.configure(fg="#DDDDDD" if is_caesar else "#6A6A6A")
-
-    # File buttons
-    state_files = tk.NORMAL if is_fernet else tk.DISABLED
-    encrypt_file_btn.configure(state=state_files)
-    decrypt_file_btn.configure(state=state_files)
-
-cipher_combo.bind("<<ComboboxSelected>>", update_controls)
-
-# ---- Middle frame (text area)
-middle_frame = tk.Frame(root, bg="#121212")
-middle_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=6)
-
-label = tk.Label(
-    middle_frame,
-    text="Enter text (or paste encrypted text here):",
-    fg="#CCCCCC",
-    bg="#121212",
-    font=("Segoe UI", 11)
-)
-label.pack(anchor="w", pady=(4, 6))
-
-text_area = scrolledtext.ScrolledText(
-    middle_frame,
-    wrap=tk.WORD,
-    width=96,
-    height=20,
-    font=("Consolas", 11),
-    bg="#1E1E1E",
-    fg="#EDEDED",
-    insertbackground="white",
-)
-text_area.pack(fill=tk.BOTH, expand=True)
-
-# ---- Buttons frame (text actions)
-btn_frame = tk.Frame(root, bg="#121212")
-btn_frame.pack(fill=tk.X, padx=16, pady=(8, 4))
-
-
-def styled_button(parent, text, cmd, width=16, bg="#2D2D2D"):
-    btn = tk.Button(
-        parent,
-        text=text,
-        command=cmd,
-        width=width,
-        font=("Segoe UI", 10, "bold"),
-        bg=bg,
-        fg="white",
-        activebackground="#555555",
-        bd=0,
-        padx=6,
-        pady=8,
-    )
-    return btn
-
-encrypt_btn = styled_button(btn_frame, "Encrypt Text", encrypt_text, bg="#1565C0")
-encrypt_btn.grid(row=0, column=0, padx=6, pady=4)
-
-decrypt_btn = styled_button(btn_frame, "Decrypt Text", decrypt_text, bg="#2E7D32")
-decrypt_btn.grid(row=0, column=1, padx=6, pady=4)
-
-copy_btn = styled_button(btn_frame, "Copy", copy_to_clipboard, bg="#FFC107")
-copy_btn.grid(row=0, column=2, padx=6, pady=4)
-
-paste_btn = styled_button(btn_frame, "Paste", paste_from_clipboard, bg="#FF7043")
-paste_btn.grid(row=0, column=3, padx=6, pady=4)
-
-# ---- File operations frame (Fernet only)
-file_frame = tk.Frame(root, bg="#121212")
-file_frame.pack(fill=tk.X, padx=16, pady=(6, 12))
-
-encrypt_file_btn = styled_button(file_frame, "Encrypt File (Fernet)", encrypt_file, bg="#8E24AA", width=20)
-encrypt_file_btn.grid(row=0, column=0, padx=10)
-
-decrypt_file_btn = styled_button(file_frame, "Decrypt File (Fernet)", decrypt_file, bg="#C62828", width=20)
-decrypt_file_btn.grid(row=0, column=1, padx=10)
-
-# ---- Footer / info
-footer = tk.Label(
-    root,
-    text=(
-        "Notes: Fernet is secure and supports files. Caesar/Substitution are classic ciphers for learning and text only.\n"
-        "For Fernet, your 'Gate' is the only secret; choose the same for decryption."
-    ),
-    fg="#AFAFAF",
-    bg="#121212",
-    font=("Segoe UI", 9),
-    justify=tk.CENTER,
-)
-footer.pack(side=tk.BOTTOM, pady=(0, 10))
-
-# Initialize control states
-update_controls()
+tk.Button(btn_frame, text="Encrypt Text", command=encrypt_text, bg="#1565C0", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(btn_frame, text="Decrypt Text", command=decrypt_text, bg="#2E7D32", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(btn_frame, text="Encrypt File", command=encrypt_file, bg="#8E24AA", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(btn_frame, text="Decrypt File", command=decrypt_file, bg="#C62828", fg="white").pack(side=tk.LEFT, padx=6)
+tk.Button(btn_frame, text="Copy", command=copy_clip, bg="#FFC107").pack(side=tk.LEFT, padx=6)
+tk.Button(btn_frame, text="Paste", command=paste_clip, bg="#FF7043").pack(side=tk.LEFT, padx=6)
 
 # Run
 root.mainloop()
